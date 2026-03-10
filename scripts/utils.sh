@@ -149,3 +149,136 @@ function on_exit_bench() {
         done
     fi
 }
+
+# ---------------------------------------------------------------------------
+# Example Testing Utilities
+# Used by scripts/run-examples.sh to manage iggy-server lifecycle and
+# execute SDK examples parsed from README files.
+# ---------------------------------------------------------------------------
+
+# Find and validate the iggy-server binary.
+# Args: [target_arch]
+# Prints the binary path to stdout. Returns 1 if not found.
+function find_server_binary() {
+    local target="${1:-}"
+    local server_bin
+    if [ -n "${target}" ]; then
+        server_bin="target/${target}/debug/iggy-server"
+    else
+        server_bin="target/debug/iggy-server"
+    fi
+    if [ ! -f "${server_bin}" ]; then
+        echo "Error: Server binary not found at ${server_bin}" >&2
+        if [ -n "${target}" ]; then
+            echo "  Build with: cargo build --target ${target} --bin iggy-server" >&2
+        else
+            echo "  Build with: cargo build --bin iggy-server" >&2
+        fi
+        return 1
+    fi
+    echo "${server_bin}"
+}
+
+# Find and validate the iggy CLI binary.
+# Args: [target_arch]
+# Prints the binary path to stdout. Returns 1 if not found.
+function find_cli_binary() {
+    local target="${1:-}"
+    local cli_bin
+    if [ -n "${target}" ]; then
+        cli_bin="target/${target}/debug/iggy"
+    else
+        cli_bin="target/debug/iggy"
+    fi
+    if [ ! -f "${cli_bin}" ]; then
+        echo "Error: CLI binary not found at ${cli_bin}" >&2
+        if [ -n "${target}" ]; then
+            echo "  Build with: cargo build --target ${target} --bin iggy --examples" >&2
+        else
+            echo "  Build with: cargo build --bin iggy --examples" >&2
+        fi
+        return 1
+    fi
+    echo "${cli_bin}"
+}
+
+# Remove local_data directory and server log/pid files.
+# Args: log_file pid_file
+function clean_server_data() {
+    local log_file="$1"
+    local pid_file="$2"
+    test -d local_data && rm -fr local_data || true
+    rm -f "${log_file}" "${pid_file}"
+}
+
+# Start iggy-server in the background.
+# Args: server_bin log_file pid_file [extra_server_args...]
+function start_server() {
+    local server_bin="$1"
+    local log_file="$2"
+    local pid_file="$3"
+    shift 3
+    echo "Starting server from ${server_bin}..."
+    IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy "${server_bin}" "$@" &>"${log_file}" &
+    echo $! >"${pid_file}"
+}
+
+# Start iggy-server with TCP TLS enabled in the background.
+# Args: server_bin log_file pid_file [extra_server_args...]
+function start_tls_server() {
+    local server_bin="$1"
+    local log_file="$2"
+    local pid_file="$3"
+    shift 3
+    echo "Starting TLS-enabled server from ${server_bin}..."
+    IGGY_TCP_TLS_ENABLED=true \
+    IGGY_TCP_TLS_SELF_SIGNED=true \
+    IGGY_ROOT_USERNAME=iggy \
+    IGGY_ROOT_PASSWORD=iggy \
+    "${server_bin}" "$@" &>"${log_file}" &
+    echo $! >"${pid_file}"
+}
+
+# Block until "has started" appears in the server log.
+# Args: log_file [timeout_seconds (default 300)]
+function wait_for_server() {
+    local log_file="$1"
+    local timeout="${2:-300}"
+    local elapsed=0
+    while ! grep -q "has started" "${log_file}" 2>/dev/null; do
+        if [ ${elapsed} -gt "${timeout}" ]; then
+            echo "Server did not start within ${timeout} seconds."
+            ps fx 2>/dev/null || true
+            cat "${log_file}" 2>/dev/null || true
+            return 1
+        fi
+        echo "Waiting for Iggy server to start... ${elapsed}"
+        sleep 1
+        ((elapsed += 1))
+    done
+}
+
+# Stop the server whose PID is stored in pid_file.
+# Args: pid_file
+function stop_server() {
+    local pid_file="$1"
+    if [ -f "${pid_file}" ]; then
+        kill -TERM "$(cat "${pid_file}")" 2>/dev/null || true
+        rm -f "${pid_file}"
+    fi
+}
+
+# Print pass/fail, dump the log on failure, then remove temp files.
+# Args: exit_code log_file pid_file
+function report_test_results() {
+    local exit_code="$1"
+    local log_file="$2"
+    local pid_file="$3"
+    if [ "${exit_code}" -eq 0 ]; then
+        echo "Test passed"
+    else
+        echo "Test failed, see log file:"
+        cat "${log_file}" 2>/dev/null || true
+    fi
+    rm -f "${log_file}" "${pid_file}"
+}

@@ -200,4 +200,4 @@ Most examples use shared utilities from `examples/rust/src/shared/` including:
 - Common argument parsing
 - Client setup helpers
 
-The examples are automatically tested via `scripts/run-rust-examples-from-readme.sh` to ensure they remain functional and up-to-date with the latest API changes.
+The examples are automatically tested via `scripts/run-examples.sh --language rust` to ensure they remain functional and up-to-date with the latest API changes.

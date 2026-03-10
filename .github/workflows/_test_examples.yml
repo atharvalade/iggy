@@ -129,25 +129,25 @@ jobs:
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-rust'
         run: |
           echo "Running Rust examples tests..."
-          ./scripts/run-rust-examples-from-readme.sh
+          ./scripts/run-examples.sh --language rust
 
       - name: Run Go examples
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-go'
         run: |
           echo "Running Go examples tests..."
-          ./scripts/run-go-examples-from-readme.sh
+          ./scripts/run-examples.sh --language go
 
       - name: Run Csharp examples
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-csharp'
         run: |
           echo "Running Csharp examples tests..."
-          ./scripts/run-csharp-examples-from-readme.sh
+          ./scripts/run-examples.sh --language csharp
 
       - name: Run Python examples
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
         run: |
           echo "Running Python examples tests..."
-          ./scripts/run-python-examples-from-readme.sh
+          ./scripts/run-examples.sh --language python
 
       - name: Run Node.js examples
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-node'
@@ -162,13 +162,13 @@ jobs:
           cd examples/node
           npm ci
           cd ../..
-          ./scripts/run-node-examples-from-readme.sh
+          ./scripts/run-examples.sh --language node
 
       - name: Run Java examples
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-java'
         run: |
           echo "Running Java examples tests..."
-          ./scripts/run-java-examples-from-readme.sh
+          ./scripts/run-examples.sh --language java
 
       - name: Upload reports
         if: always()
