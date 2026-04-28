@@ -65,6 +65,8 @@ mod tests {
             store_secret_access_key: None,
             store_region: "us-east-1".to_string(),
             store_class: IcebergSinkStoreClass::S3,
+            target_file_size_bytes: None,
+            parquet_compression: None,
         }
     }
 

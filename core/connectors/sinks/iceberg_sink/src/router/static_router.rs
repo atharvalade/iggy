@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::router::{Router, is_valid_namespaced_table, table_exists, write_data};
+use crate::router::{Router, WriteOptions, is_valid_namespaced_table, table_exists, write_data_with_options};
 use async_trait::async_trait;
 use iceberg::Catalog;
 use iceberg::table::Table;
@@ -27,12 +27,14 @@ use tracing::{error, info, warn};
 pub(crate) struct StaticRouter {
     tables: Vec<Table>,
     catalog: Box<dyn Catalog>,
+    options: WriteOptions,
 }
 
 impl StaticRouter {
     pub async fn new(
         catalog: Box<dyn Catalog>,
         declared_tables: &Vec<String>,
+        options: WriteOptions,
     ) -> Result<Self, Error> {
         let mut tables: Vec<Table> = Vec::with_capacity(declared_tables.len());
         for declared_table in declared_tables {
@@ -65,7 +67,7 @@ impl StaticRouter {
             error!("No valid tables found. Can't initiate Iceberg connector");
             return Err(Error::InvalidConfig);
         }
-        Ok(StaticRouter { tables, catalog })
+        Ok(StaticRouter { tables, catalog, options })
     }
 }
 
@@ -82,11 +84,12 @@ impl Router for StaticRouter {
             .collect();
 
         for table in &self.tables {
-            write_data(
+            write_data_with_options(
                 &data,
                 table,
                 self.catalog.as_ref(),
                 messages_metadata.schema,
+                &self.options,
             )
             .await?;
             info!(
@@ -98,4 +101,5 @@ impl Router for StaticRouter {
 
         Ok(())
     }
+
 }

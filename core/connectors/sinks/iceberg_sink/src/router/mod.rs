@@ -36,10 +36,37 @@ use iceberg::{
     writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
 };
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Schema};
+use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use std::sync::Arc;
 use tracing::{error, warn};
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy)]
+pub struct WriteOptions {
+    pub target_file_size_bytes: Option<u64>,
+    pub compression: Option<Compression>,
+}
+
+impl Default for WriteOptions {
+    fn default() -> Self {
+        Self {
+            target_file_size_bytes: None,
+            compression: None,
+        }
+    }
+}
+
+pub fn parse_compression(s: &str) -> Option<Compression> {
+    match s.to_lowercase().as_str() {
+        "none" | "uncompressed" => Some(Compression::UNCOMPRESSED),
+        "snappy" => Some(Compression::SNAPPY),
+        "gzip" => Some(Compression::GZIP(parquet::basic::GzipLevel::default())),
+        "lz4" => Some(Compression::LZ4),
+        "zstd" => Some(Compression::ZSTD(parquet::basic::ZstdLevel::default())),
+        _ => None,
+    }
+}
 
 mod arrow_streamer;
 pub mod dynamic_router;
@@ -100,11 +127,12 @@ fn get_partition_type_value(default_partition_type: &StructType) -> Result<Optio
     Ok(Some(Struct::from_iter(fields)))
 }
 
-async fn write_data(
+pub(crate) async fn write_data_with_options(
     messages: &[Payload],
     table: &Table,
     catalog: &dyn Catalog,
     messages_schema: Schema,
+    options: &WriteOptions,
 ) -> Result<(), Error> {
     let location = DefaultLocationGenerator::new(table.metadata().clone()).map_err(|err| {
         error!(
@@ -121,17 +149,32 @@ async fn write_data(
         iceberg::spec::DataFileFormat::Parquet,
     );
 
+    let mut props_builder = WriterProperties::builder();
+    if let Some(codec) = options.compression {
+        props_builder = props_builder.set_compression(codec);
+    }
+    let writer_props = props_builder.build();
+
     let parquet_writer_builder = ParquetWriterBuilder::new(
-        WriterProperties::default(),
+        writer_props,
         table.metadata().current_schema().clone(),
     );
 
-    let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_writer_builder,
-        table.file_io().clone(),
-        location.clone(),
-        file_name_gen.clone(),
-    );
+    let rolling_file_writer_builder = match options.target_file_size_bytes {
+        Some(size) => RollingFileWriterBuilder::new(
+            parquet_writer_builder,
+            size as usize,
+            table.file_io().clone(),
+            location.clone(),
+            file_name_gen.clone(),
+        ),
+        None => RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_writer_builder,
+            table.file_io().clone(),
+            location.clone(),
+            file_name_gen.clone(),
+        ),
+    };
 
     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
 

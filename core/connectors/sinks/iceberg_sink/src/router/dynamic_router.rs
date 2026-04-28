@@ -17,12 +17,12 @@
  * under the License.
  */
 
-use crate::router::{Router, is_valid_namespaced_table, table_exists, write_data};
+use crate::router::{Router, WriteOptions, is_valid_namespaced_table, table_exists, write_data_with_options};
 use async_trait::async_trait;
 use iceberg::Catalog;
 use iceberg::table::Table;
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload};
-use simd_json::base::ValueAsObject;
+use simd_json::base::{ValueAsObject, ValueAsScalar};
 use std::collections::HashMap;
 use tracing::{info, warn};
 
@@ -30,6 +30,7 @@ use tracing::{info, warn};
 pub struct DynamicRouter {
     catalog: Box<dyn Catalog>,
     route_field: String,
+    options: WriteOptions,
 }
 
 pub struct DynamicWriter {
@@ -77,10 +78,11 @@ impl DynamicWriter {
 }
 
 impl DynamicRouter {
-    pub fn new(catalog: Box<dyn Catalog>, route_field: String) -> Self {
+    pub fn new(catalog: Box<dyn Catalog>, route_field: String, options: WriteOptions) -> Self {
         Self {
             catalog,
             route_field,
+            options,
         }
     }
 
@@ -89,7 +91,7 @@ impl DynamicRouter {
             Payload::Json(payload) => payload
                 .as_object()
                 .and_then(|obj| obj.get(&self.route_field))
-                .map(|val| val.to_string()),
+                .and_then(|val| val.as_str().map(|s| s.to_string())),
             _ => {
                 warn!("Unsupported format for iceberg connector");
                 None
@@ -150,11 +152,12 @@ impl Router for DynamicRouter {
 
             let data: Vec<Payload> = batch_messages.into_iter().map(|m| m.payload).collect();
 
-            write_data(
+            write_data_with_options(
                 &data,
                 table_obj,
                 self.catalog.as_ref(),
                 messages_metadata.schema,
+                &self.options,
             )
             .await?;
             info!(
@@ -166,4 +169,5 @@ impl Router for DynamicRouter {
 
         Ok(())
     }
+
 }

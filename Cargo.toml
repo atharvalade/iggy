@@ -264,7 +264,9 @@ sqlx = { version = "0.8.6", features = [
     "chrono",
     "uuid",
     "json",
+    "rust_decimal",
 ] }
+rust_decimal = { version = "1", features = ["serde-with-str"] }
 static-toml = "1.3.0"
 strum = { version = "0.28.0", features = ["derive"] }
 strum_macros = "0.28.0"

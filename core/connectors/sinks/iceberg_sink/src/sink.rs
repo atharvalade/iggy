@@ -20,7 +20,7 @@
 use crate::{
     IcebergSink,
     catalog::init_catalog,
-    router::{dynamic_router::DynamicRouter, static_router::StaticRouter},
+    router::{WriteOptions, dynamic_router::DynamicRouter, parse_compression, static_router::StaticRouter},
 };
 use async_trait::async_trait;
 use iceberg::Catalog;
@@ -66,14 +66,31 @@ impl Sink for IcebergSink {
 
         let catalog: Box<dyn Catalog> = init_catalog(&self.config).await?;
 
+        let write_options = WriteOptions {
+            target_file_size_bytes: self.config.target_file_size_bytes,
+            compression: self
+                .config
+                .parquet_compression
+                .as_deref()
+                .and_then(parse_compression),
+        };
+
+        if let Some(ref codec) = self.config.parquet_compression {
+            info!("Parquet compression: {codec}");
+        }
+        if let Some(size) = self.config.target_file_size_bytes {
+            info!("Target file size: {} bytes ({} MB)", size, size / 1024 / 1024);
+        }
+
         if self.config.dynamic_routing {
             self.router = Some(Box::new(DynamicRouter::new(
                 catalog,
                 self.config.dynamic_route_field.clone(),
+                write_options,
             )))
         } else {
             self.router = Some(Box::new(
-                StaticRouter::new(catalog, &self.config.tables).await?,
+                StaticRouter::new(catalog, &self.config.tables, write_options).await?,
             ));
         }
 

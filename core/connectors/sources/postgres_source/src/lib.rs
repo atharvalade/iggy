@@ -77,6 +77,21 @@ pub struct PostgresSourceConfig {
     pub verbose_logging: Option<bool>,
     pub max_retries: Option<u32>,
     pub retry_delay: Option<String>,
+    /// Namespace prefix for table names in emitted records (e.g. "tpch" -> "tpch.lineitem").
+    /// Required for Iceberg dynamic routing which expects "namespace.table" format.
+    pub table_namespace: Option<String>,
+    /// Process tables concurrently instead of sequentially during polling.
+    pub parallel_tables: Option<bool>,
+    /// Number of row-range chunks to split large tables into for parallel reads.
+    /// Only used when parallel_tables is enabled and mode is "snapshot" or "polling".
+    pub chunk_size: Option<u64>,
+    /// Snapshot mode: "full" performs an initial bulk read of all existing data
+    /// before switching to CDC. Requires mode = "cdc".
+    pub snapshot_mode: Option<String>,
+    /// When true, emit flat JSON with column values at the top level alongside
+    /// `table_name`, instead of wrapping in a DatabaseRecord envelope.
+    /// Useful for sinks (like Iceberg) that need JSON matching the target schema.
+    pub flat_json_output: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -104,6 +119,8 @@ struct State {
     last_poll_time: DateTime<Utc>,
     tracking_offsets: HashMap<String, String>,
     processed_rows: u64,
+    snapshot_completed: bool,
+    snapshot_tables_done: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -146,6 +163,8 @@ impl PostgresSource {
                 last_poll_time: Utc::now(),
                 tracking_offsets: HashMap::new(),
                 processed_rows: 0,
+                snapshot_completed: false,
+                snapshot_tables_done: Vec::new(),
             })),
             verbose,
             retry_delay,
@@ -170,10 +189,22 @@ impl Source for PostgresSource {
 
         match self.config.mode.as_str() {
             "cdc" => {
-                self.setup_cdc().await?;
+                let snapshot = self.config.snapshot_mode.as_deref().unwrap_or("none");
+                if snapshot == "full" {
+                    let is_done = self.state.lock().await.snapshot_completed;
+                    if !is_done {
+                        info!(
+                            "Snapshot mode 'full' enabled for connector ID: {}. Will bulk-read all tables before switching to CDC.",
+                            self.id
+                        );
+                    }
+                    self.setup_cdc().await?;
+                } else {
+                    self.setup_cdc().await?;
+                }
                 let backend = self.config.cdc_backend.as_deref().unwrap_or("builtin");
                 info!(
-                    "PostgreSQL CDC mode enabled (backend: {backend}) for connector ID: {}",
+                    "PostgreSQL CDC mode enabled (backend: {backend}, snapshot: {snapshot}) for connector ID: {}",
                     self.id
                 );
             }
@@ -204,8 +235,23 @@ impl Source for PostgresSource {
         tokio::time::sleep(poll_interval).await;
 
         let messages = match self.config.mode.as_str() {
-            "polling" => self.poll_tables().await?,
-            "cdc" => self.poll_cdc().await?,
+            "polling" => match self.poll_tables().await {
+                Ok(msgs) => msgs,
+                Err(e) => {
+                    error!("poll_tables error: {:?}", e);
+                    return Err(e);
+                }
+            },
+            "cdc" => {
+                let snapshot_mode = self.config.snapshot_mode.as_deref().unwrap_or("none");
+                if snapshot_mode == "full" {
+                    let is_done = self.state.lock().await.snapshot_completed;
+                    if !is_done {
+                        return self.poll_snapshot_phase().await;
+                    }
+                }
+                self.poll_cdc().await?
+            }
             _ => {
                 error!("Invalid mode: {}", self.config.mode);
                 return Err(Error::InvalidConfig);
@@ -435,6 +481,14 @@ impl PostgresSource {
     }
 
     async fn poll_tables(&self) -> Result<Vec<ProducedMessage>, Error> {
+        if self.config.parallel_tables.unwrap_or(false) {
+            self.poll_tables_parallel().await
+        } else {
+            self.poll_tables_sequential().await
+        }
+    }
+
+    async fn poll_tables_sequential(&self) -> Result<Vec<ProducedMessage>, Error> {
         let pool = self.get_pool()?;
         let mut messages = Vec::new();
 
@@ -448,12 +502,10 @@ impl PostgresSource {
         let payload_format = self.payload_format();
         let payload_col = self.config.payload_column.as_deref().unwrap_or("");
 
-        // Collect state updates to apply after processing
         let mut state_updates: Vec<(String, String)> = Vec::new();
         let mut total_processed: u64 = 0;
 
         for table in &self.config.tables {
-            // Get last offset with minimal lock time
             let last_offset = {
                 let state = self.state.lock().await;
                 state.tracking_offsets.get(table).cloned()
@@ -466,7 +518,6 @@ impl PostgresSource {
                 self.build_polling_query(table, tracking_column, &last_offset, batch_size)?
             };
 
-            // Database I/O without holding the lock
             let rows = with_retry(
                 || sqlx::query(&query).fetch_all(pool),
                 self.get_max_retries(),
@@ -474,108 +525,35 @@ impl PostgresSource {
             )
             .await?;
 
-            let mut max_offset: Option<String> = None;
-            let mut processed_ids: Vec<String> = Vec::new();
+            let (table_messages, max_offset, processed_ids) = self.process_rows(
+                &rows,
+                table,
+                tracking_column,
+                pk_column,
+                payload_format,
+                payload_col,
+            )?;
 
-            for row in rows {
-                let mut row_pk: Option<String> = None;
-                let mut extracted_payload: Option<Vec<u8>> = None;
-                let mut data = serde_json::Map::new();
-
-                for (i, column) in row.columns().iter().enumerate() {
-                    let column_name = if self.config.snake_case_columns.unwrap_or(false) {
-                        to_snake_case(column.name())
-                    } else {
-                        column.name().to_string()
-                    };
-
-                    if !payload_col.is_empty() && column.name() == payload_col {
-                        extracted_payload =
-                            Some(self.extract_payload_column(&row, i, payload_format)?);
-                        continue;
-                    }
-
-                    let value = self.extract_column_value(&row, i)?;
-                    data.insert(column_name.clone(), value.clone());
-
-                    if column.name() == tracking_column {
-                        if let serde_json::Value::String(ref s) = value {
-                            max_offset = Some(s.clone());
-                        } else if let serde_json::Value::Number(ref n) = value {
-                            max_offset = Some(n.to_string());
-                        }
-                    }
-
-                    if column.name() == pk_column {
-                        if let serde_json::Value::String(ref s) = value {
-                            row_pk = Some(s.clone());
-                        } else if let serde_json::Value::Number(ref n) = value {
-                            row_pk = Some(n.to_string());
-                        }
-                    }
-                }
-
-                if let Some(pk) = row_pk {
-                    processed_ids.push(pk);
-                }
-
-                let payload = if let Some(bytes) = extracted_payload {
-                    bytes
-                } else {
-                    let record = if self.config.include_metadata.unwrap_or(true) {
-                        DatabaseRecord {
-                            table_name: table.clone(),
-                            operation_type: "SELECT".to_string(),
-                            timestamp: Utc::now(),
-                            data: serde_json::Value::Object(data),
-                            old_data: None,
-                        }
-                    } else {
-                        let mut simple_record = serde_json::Map::new();
-                        simple_record.insert("data".to_string(), serde_json::Value::Object(data));
-                        DatabaseRecord {
-                            table_name: table.clone(),
-                            operation_type: "SELECT".to_string(),
-                            timestamp: Utc::now(),
-                            data: serde_json::Value::Object(simple_record),
-                            old_data: None,
-                        }
-                    };
-                    simd_json::to_vec(&record).map_err(|_| Error::InvalidRecord)?
-                };
-
-                let message = ProducedMessage {
-                    id: Some(Uuid::new_v4().as_u128()),
-                    headers: None,
-                    checksum: None,
-                    timestamp: Some(Utc::now().timestamp_millis() as u64),
-                    origin_timestamp: Some(Utc::now().timestamp_millis() as u64),
-                    payload,
-                };
-
-                messages.push(message);
-                total_processed += 1;
-            }
-
-            // Database I/O without holding the lock
             if !processed_ids.is_empty() {
                 self.mark_or_delete_processed_rows(pool, table, pk_column, &processed_ids)
                     .await?;
             }
 
-            // Collect offset update for later
+            let count = table_messages.len();
+            total_processed += count as u64;
+            messages.extend(table_messages);
+
             if let Some(offset) = max_offset {
                 state_updates.push((table.clone(), offset));
             }
 
             if self.verbose {
-                info!("Fetched {} rows from table '{table}'", messages.len());
+                info!("Fetched {count} rows from table '{table}'");
             } else {
-                debug!("Fetched {} rows from table '{table}'", messages.len());
+                debug!("Fetched {count} rows from table '{table}'");
             }
         }
 
-        // Apply all state updates with a single lock acquisition
         {
             let mut state = self.state.lock().await;
             state.processed_rows += total_processed;
@@ -586,6 +564,346 @@ impl PostgresSource {
         }
 
         Ok(messages)
+    }
+
+    async fn poll_tables_parallel(&self) -> Result<Vec<ProducedMessage>, Error> {
+        let pool = self.get_pool()?.clone();
+        let batch_size = self.config.batch_size.unwrap_or(1000);
+        let tracking_column = self.config.tracking_column.as_deref().unwrap_or("id").to_string();
+        let pk_column = self
+            .config
+            .primary_key_column
+            .as_deref()
+            .unwrap_or(&tracking_column)
+            .to_string();
+        let payload_format = self.payload_format();
+        let payload_col = self.config.payload_column.as_deref().unwrap_or("").to_string();
+        let snake_case = self.config.snake_case_columns.unwrap_or(false);
+        let include_metadata = self.config.include_metadata.unwrap_or(true);
+        let table_namespace = self.config.table_namespace.clone();
+        let max_retries = self.get_max_retries();
+        let retry_delay_ms = self.retry_delay.as_millis() as u64;
+        let verbose = self.verbose;
+        let chunk_size = self.config.chunk_size;
+        let flat_json_output = self.config.flat_json_output.unwrap_or(false);
+
+        let offsets: HashMap<String, Option<String>> = {
+            let state = self.state.lock().await;
+            self.config
+                .tables
+                .iter()
+                .map(|t| (t.clone(), state.tracking_offsets.get(t).cloned()))
+                .collect()
+        };
+
+        let tables = self.config.tables.clone();
+        let custom_query = self.config.custom_query.clone();
+        let initial_offset = self.config.initial_offset.clone();
+        let processed_column = self.config.processed_column.clone();
+        let delete_after_read = self.config.delete_after_read.unwrap_or(false);
+
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for table in tables {
+            let pool = pool.clone();
+            let tracking_col = tracking_column.clone();
+            let pk_col = pk_column.clone();
+            let payload_c = payload_col.clone();
+            let last_offset = offsets.get(&table).cloned().flatten();
+            let custom_q = custom_query.clone();
+            let init_offset = initial_offset.clone();
+            let proc_col = processed_column.clone();
+            let ns = table_namespace.clone();
+
+            if let Some(cs) = chunk_size {
+                join_set.spawn(poll_table_chunked(
+                    pool,
+                    table,
+                    tracking_col,
+                    pk_col,
+                    payload_c,
+                    payload_format,
+                    snake_case,
+                    include_metadata,
+                    ns,
+                    last_offset,
+                    cs,
+                    max_retries,
+                    retry_delay_ms,
+                    delete_after_read,
+                    proc_col,
+                    verbose,
+                    flat_json_output,
+                ));
+            } else {
+                join_set.spawn(async move {
+                    let query = if let Some(ref cq) = custom_q {
+                        substitute_query_params_static(cq, &table, &last_offset, batch_size, &init_offset)
+                    } else {
+                        build_polling_query_static(
+                            &table,
+                            &tracking_col,
+                            &last_offset,
+                            batch_size,
+                            &init_offset,
+                            proc_col.as_deref(),
+                        )?
+                    };
+
+                    let rows = with_retry(
+                        || sqlx::query(&query).fetch_all(&pool),
+                        max_retries,
+                        retry_delay_ms,
+                    )
+                    .await?;
+
+                    let mut messages = Vec::with_capacity(rows.len());
+                    let mut max_offset: Option<String> = None;
+                    let mut processed_ids: Vec<String> = Vec::new();
+
+                    let emit_table_name = match &ns {
+                        Some(namespace) => format!("{namespace}.{table}"),
+                        None => table.clone(),
+                    };
+
+                    for row in &rows {
+                        let mut row_pk: Option<String> = None;
+                        let mut extracted_payload: Option<Vec<u8>> = None;
+                        let mut data = serde_json::Map::new();
+
+                        for (i, column) in row.columns().iter().enumerate() {
+                            let column_name = if snake_case {
+                                to_snake_case(column.name())
+                            } else {
+                                column.name().to_string()
+                            };
+
+                            if !payload_c.is_empty() && column.name() == payload_c {
+                                extracted_payload =
+                                    Some(extract_payload_column_static(row, i, payload_format)?);
+                                continue;
+                            }
+
+                            let value = extract_column_value_static(row, i)?;
+                            data.insert(column_name.clone(), value.clone());
+
+                            if column.name() == tracking_col {
+                                if let serde_json::Value::String(ref s) = value {
+                                    max_offset = Some(s.clone());
+                                } else if let serde_json::Value::Number(ref n) = value {
+                                    max_offset = Some(n.to_string());
+                                }
+                            }
+
+                            if column.name() == pk_col {
+                                if let serde_json::Value::String(ref s) = value {
+                                    row_pk = Some(s.clone());
+                                } else if let serde_json::Value::Number(ref n) = value {
+                                    row_pk = Some(n.to_string());
+                                }
+                            }
+                        }
+
+                        if let Some(pk) = row_pk {
+                            processed_ids.push(pk);
+                        }
+
+                        let payload = if let Some(bytes) = extracted_payload {
+                            bytes
+                        } else if flat_json_output {
+                            data.insert(
+                                "table_name".to_string(),
+                                serde_json::Value::String(emit_table_name.clone()),
+                            );
+                            simd_json::to_vec(&data).map_err(|_| Error::InvalidRecord)?
+                        } else {
+                            let record = if include_metadata {
+                                DatabaseRecord {
+                                    table_name: emit_table_name.clone(),
+                                    operation_type: "SELECT".to_string(),
+                                    timestamp: Utc::now(),
+                                    data: serde_json::Value::Object(data),
+                                    old_data: None,
+                                }
+                            } else {
+                                let mut simple_record = serde_json::Map::new();
+                                simple_record
+                                    .insert("data".to_string(), serde_json::Value::Object(data));
+                                DatabaseRecord {
+                                    table_name: emit_table_name.clone(),
+                                    operation_type: "SELECT".to_string(),
+                                    timestamp: Utc::now(),
+                                    data: serde_json::Value::Object(simple_record),
+                                    old_data: None,
+                                }
+                            };
+                            simd_json::to_vec(&record).map_err(|_| Error::InvalidRecord)?
+                        };
+
+                        messages.push(ProducedMessage {
+                            id: Some(Uuid::new_v4().as_u128()),
+                            headers: None,
+                            checksum: None,
+                            timestamp: Some(Utc::now().timestamp_millis() as u64),
+                            origin_timestamp: Some(Utc::now().timestamp_millis() as u64),
+                            payload,
+                        });
+                    }
+
+                    if !processed_ids.is_empty() && (delete_after_read || proc_col.is_some()) {
+                        mark_or_delete_static(
+                            &pool,
+                            &table,
+                            &pk_col,
+                            &processed_ids,
+                            delete_after_read,
+                            proc_col.as_deref(),
+                        )
+                        .await?;
+                    }
+
+                    if verbose {
+                        info!("Fetched {} rows from table '{table}'", messages.len());
+                    } else {
+                        debug!("Fetched {} rows from table '{table}'", messages.len());
+                    }
+
+                    Ok::<_, Error>((table, messages, max_offset))
+                });
+            }
+        }
+
+        let mut all_messages = Vec::new();
+        let mut state_updates = Vec::new();
+        let mut total_processed: u64 = 0;
+
+        while let Some(result) = join_set.join_next().await {
+            let (table, msgs, offset) = result.map_err(|e| {
+                error!("Table poll task panicked: {e}");
+                Error::InvalidRecord
+            })??;
+
+            total_processed += msgs.len() as u64;
+            all_messages.extend(msgs);
+            if let Some(off) = offset {
+                state_updates.push((table, off));
+            }
+        }
+
+        {
+            let mut state = self.state.lock().await;
+            state.processed_rows += total_processed;
+            for (table, offset) in state_updates {
+                state.tracking_offsets.insert(table, offset);
+            }
+            state.last_poll_time = Utc::now();
+        }
+
+        Ok(all_messages)
+    }
+
+    async fn poll_snapshot_phase(&self) -> Result<ProducedMessages, Error> {
+        let pool = self.get_pool()?.clone();
+        let tracking_column = self.config.tracking_column.as_deref().unwrap_or("id").to_string();
+        let pk_column = self
+            .config
+            .primary_key_column
+            .as_deref()
+            .unwrap_or(&tracking_column)
+            .to_string();
+        let payload_format = self.payload_format();
+        let payload_col = self.config.payload_column.as_deref().unwrap_or("").to_string();
+        let snake_case = self.config.snake_case_columns.unwrap_or(false);
+        let include_metadata = self.config.include_metadata.unwrap_or(true);
+        let table_namespace = self.config.table_namespace.clone();
+        let max_retries = self.get_max_retries();
+        let retry_delay_ms = self.retry_delay.as_millis() as u64;
+        let verbose = self.verbose;
+        let chunk_size = self.config.chunk_size.unwrap_or(100_000);
+
+        let tables_done: Vec<String> = {
+            let state = self.state.lock().await;
+            state.snapshot_tables_done.clone()
+        };
+
+        let remaining_tables: Vec<String> = self
+            .config
+            .tables
+            .iter()
+            .filter(|t| !tables_done.contains(t))
+            .cloned()
+            .collect();
+
+        if remaining_tables.is_empty() {
+            let mut state = self.state.lock().await;
+            state.snapshot_completed = true;
+            info!("Snapshot phase complete. Switching to live CDC.");
+            return Ok(ProducedMessages {
+                schema: Schema::Json,
+                messages: Vec::new(),
+                state: self.serialize_state(&state),
+            });
+        }
+
+        let table = remaining_tables[0].clone();
+        info!(
+            "Snapshot phase: reading table '{}' ({}/{} remaining)",
+            table,
+            remaining_tables.len(),
+            self.config.tables.len()
+        );
+
+        let flat_json_output = self.config.flat_json_output.unwrap_or(false);
+        let (_, messages, max_offset) = poll_table_chunked(
+            pool,
+            table.clone(),
+            tracking_column,
+            pk_column,
+            payload_col,
+            payload_format,
+            snake_case,
+            include_metadata,
+            table_namespace,
+            None,
+            chunk_size,
+            max_retries,
+            retry_delay_ms,
+            false,
+            None,
+            verbose,
+            flat_json_output,
+        )
+        .await?;
+
+        let count = messages.len();
+
+        {
+            let mut state = self.state.lock().await;
+            state.processed_rows += count as u64;
+            state.snapshot_tables_done.push(table.clone());
+            if let Some(off) = max_offset {
+                state.tracking_offsets.insert(table.clone(), off);
+            }
+
+            if state.snapshot_tables_done.len() == self.config.tables.len() {
+                state.snapshot_completed = true;
+                info!("Snapshot phase complete for all {} tables. Total rows: {}. Switching to live CDC.",
+                    self.config.tables.len(), state.processed_rows);
+            }
+        }
+
+        let state = self.state.lock().await;
+        let schema = match self.payload_format() {
+            PayloadFormat::Bytea => Schema::Raw,
+            PayloadFormat::Text => Schema::Text,
+            PayloadFormat::JsonDirect | PayloadFormat::Json => Schema::Json,
+        };
+
+        Ok(ProducedMessages {
+            schema,
+            messages,
+            state: self.serialize_state(&state),
+        })
     }
 
     async fn mark_or_delete_processed_rows(
@@ -668,6 +986,113 @@ impl PostgresSource {
             return PayloadFormat::from_config(self.config.payload_format.as_deref());
         }
         PayloadFormat::Json
+    }
+
+    fn emit_table_name(&self, table: &str) -> String {
+        match &self.config.table_namespace {
+            Some(ns) => format!("{ns}.{table}"),
+            None => table.to_string(),
+        }
+    }
+
+    fn process_rows(
+        &self,
+        rows: &[sqlx::postgres::PgRow],
+        table: &str,
+        tracking_column: &str,
+        pk_column: &str,
+        payload_format: PayloadFormat,
+        payload_col: &str,
+    ) -> Result<(Vec<ProducedMessage>, Option<String>, Vec<String>), Error> {
+        let mut messages = Vec::with_capacity(rows.len());
+        let mut max_offset: Option<String> = None;
+        let mut processed_ids: Vec<String> = Vec::new();
+        let emit_name = self.emit_table_name(table);
+
+        for row in rows {
+            let mut row_pk: Option<String> = None;
+            let mut extracted_payload: Option<Vec<u8>> = None;
+            let mut data = serde_json::Map::new();
+
+            for (i, column) in row.columns().iter().enumerate() {
+                let column_name = if self.config.snake_case_columns.unwrap_or(false) {
+                    to_snake_case(column.name())
+                } else {
+                    column.name().to_string()
+                };
+
+                if !payload_col.is_empty() && column.name() == payload_col {
+                    extracted_payload =
+                        Some(self.extract_payload_column(row, i, payload_format)?);
+                    continue;
+                }
+
+                let value = self.extract_column_value(row, i)?;
+                data.insert(column_name.clone(), value.clone());
+
+                if column.name() == tracking_column {
+                    if let serde_json::Value::String(ref s) = value {
+                        max_offset = Some(s.clone());
+                    } else if let serde_json::Value::Number(ref n) = value {
+                        max_offset = Some(n.to_string());
+                    }
+                }
+
+                if column.name() == pk_column {
+                    if let serde_json::Value::String(ref s) = value {
+                        row_pk = Some(s.clone());
+                    } else if let serde_json::Value::Number(ref n) = value {
+                        row_pk = Some(n.to_string());
+                    }
+                }
+            }
+
+            if let Some(pk) = row_pk {
+                processed_ids.push(pk);
+            }
+
+            let payload = if let Some(bytes) = extracted_payload {
+                bytes
+            } else if self.config.flat_json_output.unwrap_or(false) {
+                data.insert(
+                    "table_name".to_string(),
+                    serde_json::Value::String(emit_name.clone()),
+                );
+                simd_json::to_vec(&data).map_err(|_| Error::InvalidRecord)?
+            } else {
+                let record = if self.config.include_metadata.unwrap_or(true) {
+                    DatabaseRecord {
+                        table_name: emit_name.clone(),
+                        operation_type: "SELECT".to_string(),
+                        timestamp: Utc::now(),
+                        data: serde_json::Value::Object(data),
+                        old_data: None,
+                    }
+                } else {
+                    let mut simple_record = serde_json::Map::new();
+                    simple_record.insert("data".to_string(), serde_json::Value::Object(data));
+                    DatabaseRecord {
+                        table_name: emit_name.clone(),
+                        operation_type: "SELECT".to_string(),
+                        timestamp: Utc::now(),
+                        data: serde_json::Value::Object(simple_record),
+                        old_data: None,
+                    }
+                };
+                simd_json::to_vec(&record).map_err(|_| Error::InvalidRecord)?
+            };
+
+            messages.push(ProducedMessage {
+                id: Some(Uuid::new_v4().as_u128()),
+                headers: None,
+                checksum: None,
+                timestamp: Some(Utc::now().timestamp_millis() as u64),
+                origin_timestamp: Some(Utc::now().timestamp_millis() as u64),
+                payload,
+            });
+        }
+
+        Ok((messages, max_offset, processed_ids))
     }
 
     fn get_max_retries(&self) -> u32 {
@@ -1139,6 +1564,556 @@ fn redact_connection_string(conn_str: &str) -> String {
     format!("{preview}***")
 }
 
+async fn get_table_id_range(
+    pool: &Pool<Postgres>,
+    table: &str,
+    tracking_column: &str,
+    last_offset: &Option<String>,
+) -> Result<Option<(i64, i64)>, Error> {
+    let quoted_table = quote_identifier(table)?;
+    let quoted_tracking = quote_identifier(tracking_column)?;
+
+    let where_clause = match last_offset {
+        Some(offset) => format!(" WHERE {quoted_tracking} > {}", format_offset_value(offset)),
+        None => String::new(),
+    };
+
+    let query = format!(
+        "SELECT MIN({quoted_tracking})::BIGINT as min_id, MAX({quoted_tracking})::BIGINT as max_id FROM {quoted_table}{where_clause}"
+    );
+
+    let row = sqlx::query(&query)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to get ID range for table {table}: {e}");
+            Error::InvalidRecord
+        })?;
+
+    let min_id: Option<i64> = row.try_get("min_id").unwrap_or(None);
+    let max_id: Option<i64> = row.try_get("max_id").unwrap_or(None);
+
+    match (min_id, max_id) {
+        (Some(min), Some(max)) if max >= min => Ok(Some((min, max))),
+        _ => Ok(None),
+    }
+}
+
+fn build_chunk_query(
+    table: &str,
+    tracking_column: &str,
+    range_start: i64,
+    range_end: i64,
+    processed_column: Option<&str>,
+) -> Result<String, Error> {
+    let quoted_table = quote_identifier(table)?;
+    let quoted_tracking = quote_identifier(tracking_column)?;
+
+    let mut conditions = vec![format!(
+        "{quoted_tracking} >= {range_start} AND {quoted_tracking} <= {range_end}"
+    )];
+
+    if let Some(proc_col) = processed_column {
+        let quoted_processed = quote_identifier(proc_col)?;
+        conditions.push(format!("{quoted_processed} = FALSE"));
+    }
+
+    Ok(format!(
+        "SELECT * FROM {quoted_table} WHERE {} ORDER BY {quoted_tracking} ASC",
+        conditions.join(" AND ")
+    ))
+}
+
+async fn poll_table_chunked(
+    pool: Pool<Postgres>,
+    table: String,
+    tracking_column: String,
+    pk_column: String,
+    payload_col: String,
+    payload_format: PayloadFormat,
+    snake_case: bool,
+    include_metadata: bool,
+    table_namespace: Option<String>,
+    last_offset: Option<String>,
+    chunk_size: u64,
+    max_retries: u32,
+    retry_delay_ms: u64,
+    delete_after_read: bool,
+    processed_column: Option<String>,
+    verbose: bool,
+    flat_json_output: bool,
+) -> Result<(String, Vec<ProducedMessage>, Option<String>), Error> {
+    let range = get_table_id_range(&pool, &table, &tracking_column, &last_offset).await?;
+
+    let (min_id, max_id) = match range {
+        Some(r) => r,
+        None => {
+            debug!("No rows to process in table '{table}'");
+            return Ok((table, Vec::new(), None));
+        }
+    };
+
+    let total_rows = (max_id - min_id + 1) as u64;
+    let num_chunks = (total_rows + chunk_size - 1) / chunk_size;
+
+    info!(
+        "Table '{table}': ID range [{min_id}, {max_id}], splitting into {num_chunks} chunks of {chunk_size}"
+    );
+
+    let emit_table_name = match &table_namespace {
+        Some(ns) => format!("{ns}.{table}"),
+        None => table.clone(),
+    };
+
+    let mut chunk_tasks = tokio::task::JoinSet::new();
+
+    for chunk_idx in 0..num_chunks {
+        let range_start = min_id + (chunk_idx as i64 * chunk_size as i64);
+        let range_end = std::cmp::min(
+            range_start + chunk_size as i64 - 1,
+            max_id,
+        );
+
+        let pool = pool.clone();
+        let tbl = table.clone();
+        let tc = tracking_column.clone();
+        let pc = pk_column.clone();
+        let plc = payload_col.clone();
+        let etn = emit_table_name.clone();
+        let proc_col = processed_column.clone();
+
+        chunk_tasks.spawn(async move {
+            let query = build_chunk_query(&tbl, &tc, range_start, range_end, proc_col.as_deref())?;
+
+            let rows = with_retry(
+                || sqlx::query(&query).fetch_all(&pool),
+                max_retries,
+                retry_delay_ms,
+            )
+            .await?;
+
+            let mut messages = Vec::with_capacity(rows.len());
+            let mut max_off: Option<String> = None;
+            let mut proc_ids: Vec<String> = Vec::new();
+
+            for row in &rows {
+                let mut row_pk: Option<String> = None;
+                let mut extracted_payload: Option<Vec<u8>> = None;
+                let mut data = serde_json::Map::new();
+
+                for (i, column) in row.columns().iter().enumerate() {
+                    let column_name = if snake_case {
+                        to_snake_case(column.name())
+                    } else {
+                        column.name().to_string()
+                    };
+
+                    if !plc.is_empty() && column.name() == plc {
+                        extracted_payload =
+                            Some(extract_payload_column_static(row, i, payload_format)?);
+                        continue;
+                    }
+
+                    let value = extract_column_value_static(row, i)?;
+                    data.insert(column_name.clone(), value.clone());
+
+                    if column.name() == tc {
+                        if let serde_json::Value::String(ref s) = value {
+                            max_off = Some(s.clone());
+                        } else if let serde_json::Value::Number(ref n) = value {
+                            max_off = Some(n.to_string());
+                        }
+                    }
+                    if column.name() == pc {
+                        if let serde_json::Value::String(ref s) = value {
+                            row_pk = Some(s.clone());
+                        } else if let serde_json::Value::Number(ref n) = value {
+                            row_pk = Some(n.to_string());
+                        }
+                    }
+                }
+
+                if let Some(pk) = row_pk {
+                    proc_ids.push(pk);
+                }
+
+                let payload = if let Some(bytes) = extracted_payload {
+                    bytes
+                } else if flat_json_output {
+                    data.insert(
+                        "table_name".to_string(),
+                        serde_json::Value::String(etn.clone()),
+                    );
+                    simd_json::to_vec(&data).map_err(|_| Error::InvalidRecord)?
+                } else {
+                    let record = if include_metadata {
+                        DatabaseRecord {
+                            table_name: etn.clone(),
+                            operation_type: "SELECT".to_string(),
+                            timestamp: Utc::now(),
+                            data: serde_json::Value::Object(data),
+                            old_data: None,
+                        }
+                    } else {
+                        let mut simple_record = serde_json::Map::new();
+                        simple_record
+                            .insert("data".to_string(), serde_json::Value::Object(data));
+                        DatabaseRecord {
+                            table_name: etn.clone(),
+                            operation_type: "SELECT".to_string(),
+                            timestamp: Utc::now(),
+                            data: serde_json::Value::Object(simple_record),
+                            old_data: None,
+                        }
+                    };
+                    simd_json::to_vec(&record).map_err(|_| Error::InvalidRecord)?
+                };
+
+                messages.push(ProducedMessage {
+                    id: Some(Uuid::new_v4().as_u128()),
+                    headers: None,
+                    checksum: None,
+                    timestamp: Some(Utc::now().timestamp_millis() as u64),
+                    origin_timestamp: Some(Utc::now().timestamp_millis() as u64),
+                    payload,
+                });
+            }
+
+            if !proc_ids.is_empty() && (delete_after_read || proc_col.is_some()) {
+                mark_or_delete_static(
+                    &pool,
+                    &tbl,
+                    &pc,
+                    &proc_ids,
+                    delete_after_read,
+                    proc_col.as_deref(),
+                )
+                .await?;
+            }
+
+            Ok::<_, Error>((messages, max_off))
+        });
+    }
+
+    let mut all_messages = Vec::new();
+    let mut global_max_offset: Option<String> = None;
+
+    while let Some(result) = chunk_tasks.join_next().await {
+        let (msgs, chunk_max) = result.map_err(|e| {
+            error!("Chunk task panicked: {e}");
+            Error::InvalidRecord
+        })??;
+        all_messages.extend(msgs);
+        if let Some(off) = chunk_max {
+            global_max_offset = Some(match global_max_offset {
+                Some(prev) => {
+                    if off.parse::<i64>().unwrap_or(0) > prev.parse::<i64>().unwrap_or(0) {
+                        off
+                    } else {
+                        prev
+                    }
+                }
+                None => off,
+            });
+        }
+    }
+
+    if verbose {
+        info!(
+            "Table '{table}': fetched {} rows across {num_chunks} chunks",
+            all_messages.len()
+        );
+    } else {
+        debug!(
+            "Table '{table}': fetched {} rows across {num_chunks} chunks",
+            all_messages.len()
+        );
+    }
+
+    Ok((table, all_messages, global_max_offset))
+}
+
+fn build_polling_query_static(
+    table: &str,
+    tracking_column: &str,
+    last_offset: &Option<String>,
+    batch_size: u32,
+    initial_offset: &Option<String>,
+    processed_column: Option<&str>,
+) -> Result<String, Error> {
+    let quoted_table = quote_identifier(table)?;
+    let quoted_tracking = quote_identifier(tracking_column)?;
+
+    let base_query = format!("SELECT * FROM {quoted_table}");
+    let mut conditions = Vec::new();
+
+    if let Some(offset) = last_offset {
+        conditions.push(format!(
+            "{quoted_tracking} > {}",
+            format_offset_value(offset)
+        ));
+    } else if let Some(initial) = initial_offset {
+        conditions.push(format!(
+            "{quoted_tracking} > {}",
+            format_offset_value(initial)
+        ));
+    }
+
+    if let Some(proc_col) = processed_column {
+        let quoted_processed = quote_identifier(proc_col)?;
+        conditions.push(format!("{quoted_processed} = FALSE"));
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+
+    let order_clause = format!(" ORDER BY {quoted_tracking} ASC");
+    let limit_clause = format!(" LIMIT {batch_size}");
+
+    Ok(format!(
+        "{base_query}{where_clause}{order_clause}{limit_clause}"
+    ))
+}
+
+fn substitute_query_params_static(
+    query: &str,
+    table: &str,
+    last_offset: &Option<String>,
+    batch_size: u32,
+    initial_offset: &Option<String>,
+) -> String {
+    let offset_value = last_offset
+        .clone()
+        .or_else(|| initial_offset.clone())
+        .unwrap_or_default();
+
+    let now = Utc::now();
+
+    query
+        .replace("$table", table)
+        .replace("$offset", &offset_value)
+        .replace("$limit", &batch_size.to_string())
+        .replace("$now", &now.to_rfc3339())
+        .replace("$now_unix", &now.timestamp().to_string())
+}
+
+fn extract_column_value_static(
+    row: &sqlx::postgres::PgRow,
+    column_index: usize,
+) -> Result<serde_json::Value, Error> {
+    let column = &row.columns()[column_index];
+    let type_name = column.type_info().name();
+
+    match type_name {
+        "BOOL" => {
+            let value: Option<bool> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(serde_json::Value::Bool)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "INT2" => {
+            let value: Option<i16> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|v| serde_json::Value::from(v as i64))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "INT4" => {
+            let value: Option<i32> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|v| serde_json::Value::from(v as i64))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "INT8" => {
+            let value: Option<i64> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "FLOAT4" => {
+            let value: Option<f32> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|v| serde_json::Value::from(v as f64))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "FLOAT8" => {
+            let value: Option<f64> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "NUMERIC" => {
+            let value: Option<rust_decimal::Decimal> = row
+                .try_get(column_index)
+                .map_err(|e| {
+                    warn!("Failed to extract NUMERIC column {}: {e}", column.name());
+                    Error::InvalidRecord
+                })?;
+            Ok(value
+                .and_then(|d| {
+                    use rust_decimal::prelude::ToPrimitive;
+                    d.to_f64()
+                })
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "DATE" => {
+            let value: Option<chrono::NaiveDate> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|d| serde_json::Value::String(d.to_string()))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "VARCHAR" | "TEXT" | "CHAR" | "BPCHAR" => {
+            let value: Option<String> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "TIMESTAMP" | "TIMESTAMPTZ" => {
+            let value: Option<DateTime<Utc>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|dt| serde_json::Value::String(dt.to_rfc3339()))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "UUID" => {
+            let value: Option<Uuid> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|u| serde_json::Value::String(u.to_string()))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "JSON" | "JSONB" => {
+            let value: Option<serde_json::Value> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value.unwrap_or(serde_json::Value::Null))
+        }
+        "BYTEA" => {
+            let value: Option<Vec<u8>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|bytes| {
+                    use base64::Engine;
+                    serde_json::Value::String(
+                        base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        _ => {
+            let value: Option<String> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null))
+        }
+    }
+}
+
+fn extract_payload_column_static(
+    row: &sqlx::postgres::PgRow,
+    column_index: usize,
+    format: PayloadFormat,
+) -> Result<Vec<u8>, Error> {
+    match format {
+        PayloadFormat::Bytea => {
+            let bytes: Option<Vec<u8>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(bytes.unwrap_or_default())
+        }
+        PayloadFormat::Text => {
+            let text: Option<String> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(text.unwrap_or_default().into_bytes())
+        }
+        PayloadFormat::JsonDirect => {
+            let json_value: Option<serde_json::Value> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            simd_json::to_vec(&json_value.unwrap_or(serde_json::Value::Null))
+                .map_err(|_| Error::InvalidRecord)
+        }
+        PayloadFormat::Json => {
+            let bytes: Option<Vec<u8>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(bytes.unwrap_or_default())
+        }
+    }
+}
+
+async fn mark_or_delete_static(
+    pool: &Pool<Postgres>,
+    table: &str,
+    pk_column: &str,
+    ids: &[String],
+    delete_after_read: bool,
+    processed_column: Option<&str>,
+) -> Result<(), Error> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    let quoted_table = quote_identifier(table)?;
+    let quoted_pk = quote_identifier(pk_column)?;
+
+    let ids_list = ids
+        .iter()
+        .map(|id| {
+            if id.parse::<i64>().is_ok() {
+                id.clone()
+            } else {
+                format!("'{}'", id.replace('\'', "''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if delete_after_read {
+        let query = format!("DELETE FROM {quoted_table} WHERE {quoted_pk} IN ({ids_list})");
+        sqlx::query(&query).execute(pool).await.map_err(|e| {
+            error!("Failed to delete processed rows: {e}");
+            Error::InvalidRecord
+        })?;
+    } else if let Some(proc_col) = processed_column {
+        let quoted_processed = quote_identifier(proc_col)?;
+        let query = format!(
+            "UPDATE {quoted_table} SET {quoted_processed} = TRUE WHERE {quoted_pk} IN ({ids_list})"
+        );
+        sqlx::query(&query).execute(pool).await.map_err(|e| {
+            error!("Failed to mark rows as processed: {e}");
+            Error::InvalidRecord
+        })?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1169,6 +2144,10 @@ mod tests {
             verbose_logging: None,
             max_retries: None,
             retry_delay: None,
+            table_namespace: None,
+            parallel_tables: None,
+            chunk_size: None,
+            snapshot_mode: None,
         }
     }
 
@@ -1341,6 +2320,8 @@ mod tests {
                 ("orders".to_string(), "2024-01-15T10:30:00Z".to_string()),
             ]),
             processed_rows: 500,
+            snapshot_completed: false,
+            snapshot_tables_done: Vec::new(),
         };
 
         let connector_state =
@@ -1396,6 +2377,8 @@ mod tests {
                 .with_timezone(&Utc),
             tracking_offsets: HashMap::from([("table1".to_string(), "42".to_string())]),
             processed_rows: 1000,
+            snapshot_completed: false,
+            snapshot_tables_done: Vec::new(),
         };
 
         let connector_state =

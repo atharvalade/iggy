@@ -64,6 +64,12 @@ pub struct IcebergSinkConfig {
     pub store_secret_access_key: Option<String>,
     pub store_region: String,
     pub store_class: IcebergSinkStoreClass,
+    /// Target Parquet file size in bytes for rolling writer.
+    /// Default: 536870912 (512 MB, Iceberg's default).
+    pub target_file_size_bytes: Option<u64>,
+    /// Parquet compression codec: "snappy", "gzip", "lz4", "zstd", or "none".
+    /// Default: Parquet library default (usually snappy).
+    pub parquet_compression: Option<String>,
 }
 
 fn slice_user_table(table: &str) -> Vec<String> {
